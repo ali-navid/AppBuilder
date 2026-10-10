@@ -1,0 +1,125 @@
+name: App Factory Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:          { description: "شناسهٔ کوتاه مشتری (مثل fidas)", required: true, default: "parsbit" }
+      app_name:      { description: "نام نمایشی اپ", required: true, default: "پارس بیت" }
+      package_id:    { description: "شناسهٔ بسته (مثل ir.fidas.app)", required: true, default: "com.parsbit.online" }
+      home_url:      { description: "آدرس سایت", required: true, default: "https://pars-bit.com/" }
+      main_host:     { description: "دامنهٔ اصلی (بدون https)", required: true, default: "pars-bit.com" }
+      primary_color: { description: "رنگ اصلی #RRGGBB", required: true, default: "#1565C0" }
+      version_code:  { description: "versionCode (عدد)", required: true, default: "1" }
+      version_name:  { description: "versionName", required: true, default: "1.0.0" }
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write   # برای ساختن Release و آپلود APK
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.13' }
+
+      - name: Setup Android SDK
+        run: |
+          SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1)
+          [ -z "$SDKMANAGER" ] && { echo "sdkmanager not found"; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Decode release keystore
+        env: { KEYSTORE_BASE64: "${{ secrets.KEYSTORE_BASE64 }}" }
+        run: |
+          [ -z "$KEYSTORE_BASE64" ] && { echo "::error::Secret KEYSTORE_BASE64 تعریف نشده"; exit 1; }
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+
+      # اگر دستی اجرا شد: پارامترها از ورودی. اگر پوشهٔ apps/<slug> موجود بود، آن اولویت دارد.
+      - name: Resolve app parameters
+        id: p
+        run: |
+          SLUG="${{ github.event.inputs.slug || 'parsbit' }}"
+          APP_DIR="apps/$SLUG"
+          if [ -f "$APP_DIR/params.env" ]; then
+            echo "از $APP_DIR/params.env خوانده شد"
+            cat "$APP_DIR/params.env" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "slug=$SLUG"
+              echo "app_name=${{ github.event.inputs.app_name || 'پارس بیت' }}"
+              echo "package_id=${{ github.event.inputs.package_id || 'com.parsbit.online' }}"
+              echo "home_url=${{ github.event.inputs.home_url || 'https://pars-bit.com/' }}"
+              echo "main_host=${{ github.event.inputs.main_host || 'pars-bit.com' }}"
+              echo "primary_color=${{ github.event.inputs.primary_color || '#1565C0' }}"
+              echo "version_code=${{ github.event.inputs.version_code || '1' }}"
+              echo "version_name=${{ github.event.inputs.version_name || '1.0.0' }}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          # آیکون‌های اختصاصی مشتری (در صورت وجود) روی res کپی می‌شوند
+          if [ -d "$APP_DIR/res" ]; then cp -rf "$APP_DIR/res/." app/src/main/res/; echo "آیکون اختصاصی اعمال شد"; fi
+
+      - name: Write app_config.json
+        run: |
+          cat > app/src/main/assets/app_config.json <<JSON
+          {
+            "home_url": "${{ steps.p.outputs.home_url }}",
+            "main_host": "${{ steps.p.outputs.main_host }}",
+            "primary_color": "${{ steps.p.outputs.primary_color }}",
+            "allow_external_hosts": []
+          }
+          JSON
+          # رنگ پس‌زمینهٔ آیکون تطبیقی هم با رنگ اصلی هماهنگ شود
+          sed -i "s|<color name=\"ic_launcher_background\">[^<]*</color>|<color name=\"ic_launcher_background\">${{ steps.p.outputs.primary_color }}</color>|" app/src/main/res/values/colors.xml || true
+          cat app/src/main/assets/app_config.json
+
+      - name: Build signed Release APK
+        env:
+          KEYSTORE_PASSWORD: "${{ secrets.KEYSTORE_PASSWORD }}"
+          KEY_ALIAS: "${{ secrets.KEY_ALIAS }}"
+          KEY_PASSWORD: "${{ secrets.KEY_PASSWORD }}"
+        run: |
+          gradle assembleRelease --stacktrace \
+            -PAPP_ID="${{ steps.p.outputs.package_id }}" \
+            -PAPP_NAME="${{ steps.p.outputs.app_name }}" \
+            -PAPP_VERSION_CODE="${{ steps.p.outputs.version_code }}" \
+            -PAPP_VERSION_NAME="${{ steps.p.outputs.version_name }}"
+
+      - name: Rename & verify
+        id: apk
+        run: |
+          SRC=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          OUT="${{ steps.p.outputs.slug }}-v${{ steps.p.outputs.version_code }}.apk"
+          cp "$SRC" "$OUT"
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -n 1)
+          "$BT/apksigner" verify --verbose "$OUT" | grep -E "scheme v2|scheme v3"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+          echo "tag=app-${{ steps.p.outputs.slug }}-${{ steps.p.outputs.version_code }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Release (APK asset)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          TAG="${{ steps.apk.outputs.tag }}"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "${{ steps.apk.outputs.file }}" \
+            --title "APK ${{ steps.p.outputs.slug }} v${{ steps.p.outputs.version_name }}" \
+            --notes "ساخته‌شده توسط App Factory — ${{ steps.p.outputs.home_url }}"
+          echo "دانلود: $(gh release view "$TAG" --json assets --jq '.assets[0].url')"
+
+      - name: Upload artifact (پشتیبان)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "apk-${{ steps.p.outputs.slug }}"
+          path: "${{ steps.apk.outputs.file }}"
+          if-no-files-found: error
