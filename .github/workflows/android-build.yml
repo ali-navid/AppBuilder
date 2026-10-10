@@ -99,11 +99,16 @@ jobs:
       - name: Rename & verify
         id: apk
         run: |
-          SRC=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          # اول APK امضاشده؛ اگر نبود هر APKی که ساخته شده
+          SRC=$(find app/build/outputs/apk/release -name "*.apk" ! -name "*unsigned*" | head -n 1)
+          [ -z "$SRC" ] && SRC=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          [ -z "$SRC" ] && { echo "::error::هیچ APKی ساخته نشد"; exit 1; }
           OUT="${{ steps.p.outputs.slug }}-v${{ steps.p.outputs.version_code }}.apk"
           cp "$SRC" "$OUT"
+          echo "APK: $SRC"
           BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -n 1)
-          "$BT/apksigner" verify --verbose "$OUT" | grep -E "scheme v2|scheme v3"
+          # کد خروجی خودِ apksigner ملاک است (۰ = تأیید شد)؛ خروجی فقط برای نمایش چاپ می‌شود
+          "$BT/apksigner" verify --verbose "$OUT" || { echo "::error::امضای APK تأیید نشد — یعنی کلید درست اعمال نشده (Secretها را چک کنید)"; exit 1; }
           echo "file=$OUT" >> "$GITHUB_OUTPUT"
           echo "tag=app-${{ steps.p.outputs.slug }}-${{ steps.p.outputs.version_code }}" >> "$GITHUB_OUTPUT"
 
